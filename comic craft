@@ -1,0 +1,107 @@
+import time
+import os
+from typing import Dict, Any, List
+from dataclasses import dataclass
+from openai import OpenAI
+
+# ==========================================
+# 1. Model Configuration & Selection Matrix
+# ==========================================
+@dataclass
+class ModelConfig:
+    name: str
+    cost_per_1k_input: float
+    cost_per_1k_output: float
+    max_tokens: int
+
+AVAILABLE_MODELS = {
+    "small_fast": ModelConfig("gpt-4o-mini", 0.00015, 0.0006, 1000), # Simple tasks / Classifier
+    "large_reasoning": ModelConfig("gpt-4o", 0.0025, 0.010, 2000)   # Complex logic / Synthesis
+}
+
+# ==========================================
+# 2. Router / Fallback Architecture
+# ==========================================
+class ModelRouter:
+    def __init__(self):
+        # API client setup
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "your-api-key-here"))
+
+    def analyze_complexity(self, prompt: str) -> str:
+        """
+        Classifies whether a prompt is 'simple' or 'complex' to save costs.
+        """
+        if len(prompt.split()) > 50 or any(keyword in prompt.lower() for keyword in ["analyze", "evaluate", "explain step-by-step", "code"]):
+            return "large_reasoning"
+        return "small_fast"
+
+    def execute_with_fallback(self, prompt: str) -> Dict[str, Any]:
+        """
+        Executes primary routing logic with fallback error handling.
+        """
+        selected_model_key = self.analyze_complexity(prompt)
+        primary_config = AVAILABLE_MODELS[selected_model_key]
+        
+        # Fallback Order
+        model_attempts = [primary_config]
+        if primary_config.name != AVAILABLE_MODELS["small_fast"].name:
+            model_attempts.append(AVAILABLE_MODELS["small_fast"])
+
+        for model_cfg in model_attempts:
+            try:
+                start_time = time.time()
+                
+                # API Call execution
+                response = self.client.chat.completions.create(
+                    model=model_cfg.name,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=model_cfg.max_tokens,
+                    temperature=0.3
+                )
+                
+                latency = round(time.time() - start_time, 3)
+                usage = response.usage
+                
+                # Calculate Cost
+                input_cost = (usage.prompt_tokens / 1000) * model_cfg.cost_per_1k_input
+                output_cost = (usage.completion_tokens / 1000) * model_cfg.cost_per_1k_output
+                total_cost = round(input_cost + output_cost, 6)
+
+                return {
+                    "status": "success",
+                    "model_used": model_cfg.name,
+                    "response": response.choices[0].message.content,
+                    "metrics": {
+                        "latency_seconds": latency,
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_cost_usd": total_cost
+                    }
+                }
+
+            except Exception as e:
+                print(f"[LOG WARNING] Model {model_cfg.name} failed with error: {str(e)}. Retrying with fallback...")
+                continue
+
+        return {"status": "error", "message": "All models in fallback loop failed."}
+
+# ==========================================
+# 3. Execution / Benchmark Test
+# ==========================================
+if __name__ == "__main__":
+    router = ModelRouter()
+
+    # Test 1: Simple query -> routes to fast model
+    simple_prompt = "What is the capital of Tamil Nadu?"
+    print("\n--- Executing Query 1 ---")
+    res1 = router.execute_with_fallback(simple_prompt)
+    print(res1)
+
+    # Test 2: Complex query -> routes to reasoning model
+    complex_prompt = "Analyze step-by-step how to design a distributed cache system using Redis."
+    print("\n--- Executing Query 2 ---")
+    res2 = router.execute_with_fallback(complex_prompt)
+    print(res2)
